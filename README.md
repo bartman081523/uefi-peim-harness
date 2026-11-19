@@ -45,6 +45,10 @@ python unicorn_peim.py <module.pe.bin> [max_insns] --exec [operation] [slave] [c
 # Supply SPD data; the ReadByte reply is spd[command]
 python unicorn_peim.py <module.pe.bin> 200000 --exec 4 0x50 0x02 --spd "12 34 56 78"
 python unicorn_peim.py <module.pe.bin> 200000 --exec 4 0x50 0x00 --spd @spd.bin
+
+# Walk all commands 0x00..0x7F and assemble an SPD image
+python unicorn_peim.py <module.pe.bin> 200000 --spd-dump --spd @spd.bin --spd-out dump.bin
+python unicorn_peim.py <module.pe.bin> 200000 --spd-dump --spd-range 0x00 0x0F
 ```
 
 Examples:
@@ -100,8 +104,9 @@ Unicorn 2.1.x cannot hook `RDTSC`, `RDMSR`, or arbitrary instructions through
 - Skips the **`RDTSC` delay helper** (entry = `min(rdtsc address) - 1`) by returning from it
   immediately: hardware timing is irrelevant for logic tracing.
 - Installs **x86 IO-port hooks** (`IN`/`OUT`). The SMBus host controller is IO-decoded at
-  **`0x0B00`**; register 0 is the host status word and bit 0 is `HostBusy`. The hook reports
-  an idle/error-free controller (`0x00`) so the driver's `in al,dx` poll terminates.
+  **`0x0B00`** (and **`0x0B20`** for the second instance); register 0 is the host status word
+  and bit 0 is `HostBusy`. The hook reports an idle/error-free controller (`0x00`) so the
+  driver's `in al,dx` poll terminates.
 - Emulates the **PPI notify service** (`table+0x20`): its 5th argument is an out-pointer that
   must receive a parent function table. Some revisions dispatch their delay/ARP path through
   that table; without it, the run faults on a NULL vtable.
@@ -147,6 +152,9 @@ W 0x0B02 = 0x00                  ; control reset
 With the sample data byte, `Execute` returns `EFI_SUCCESS` and the caller's buffer contains
 `0x12` (`len=1`).
 
+`--spd-dump` walks commands `0x00..0x7F` (see `--spd-range`) and writes the collected bytes
+to an SPD image (`--spd-out`). A full 128-byte round-trip was verified on both IO bases.
+
 ## Limitations
 
 - The PEI-services table is **AMI-extended**, not the standard `PiPeiCis` order
@@ -156,9 +164,9 @@ With the sample data byte, `Execute` returns `EFI_SUCCESS` and the caller's buff
   and command are derived correctly from the PPI arguments, but real SPD contents require
   feeding the actual DIMM data into the `0x0B05` read.
 - Different firmware revisions can expose several PPI instances. On the tested image,
-  index `0` is the SMBus PPI (returns `EFI_SUCCESS`), index `1` is a second SMBus instance
-  with no responding device (`EFI_TIMEOUT`), and indexes `2/3` are a different PPI class
-  that rejects the parameters (`EFI_INVALID_PARAMETER`). Use `PEIM_PPI_INDEX` to select one.
+  index `0` (IO base `0x0B00`) and index `1` (IO base `0x0B20`) are both SMBus PPIs and
+  return `EFI_SUCCESS`; indexes `2/3` are a different PPI class that rejects the parameters
+  (`EFI_INVALID_PARAMETER`). Use `PEIM_PPI_INDEX` to select one.
 
 ## Docs
 

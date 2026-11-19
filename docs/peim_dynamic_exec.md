@@ -175,7 +175,7 @@ FIb hat vier 0x58-PPI-Kandidaten (`PEIM_PPI_INDEX=0..3`):
 | Index | `This` | `Execute` | Ergebnis |
 |------:|--------|-----------|----------|
 | 0 | `0x90001060` | `0x9ded3ae` | **`EFI_SUCCESS`**, Buffer `0x12`, 20 963 Instr. |
-| 1 | `0x90001260` | `0x9ded3ae` | `0x80000007` (`EFI_TIMEOUT`), 1.92 M Instr. |
+| 1 | `0x90001260` | `0x9ded3ae` | **`EFI_SUCCESS`**, Buffer `0x12`, 20 967 Instr. (IO-Basis `0x0B20`) |
 | 2 | `0x90001460` | `0x9ded4ac` | sauberer Return, `eax=0x80000002` (`EFI_INVALID_PARAMETER`), 76 Instr. |
 | 3 | `0x90001660` | `0x9ded4ac` | identisch zu Index 2 |
 
@@ -186,8 +186,20 @@ dort die Parent-Vtable eintragen. Unser Stub schrieb nichts → `[ppi+0x20]=0` �
 `0x9ded4a5`. Der Slot-8-Hook schreibt jetzt eine Fake-Vtable (`[VTABLE+4]` = `mov eax,0;
 ret`-Stub). Danach läuft **FIb Index 0** durch.
 
-Index 1 ist eine zweite SMBus-Instanz ohne antwortendes Gerät (`EFI_TIMEOUT` nach 0x10000
-ARP-Versuchen); Index 2/3 ist eine andere PPI-Klasse, die unsere Parameter ablehnt.
+Index 1 ist eine **zweite SMBus-Instanz auf IO-Basis `0x0B20`** (Register `0x0B20..0x0B28`);
+nach Generalisierung der IO-Hooks auf beide Basen liefert sie ebenfalls `EFI_SUCCESS`. Index 2/3
+ist eine andere PPI-Klasse, die unsere Parameter ablehnt.
+
+### SPD-Dump (`--spd-dump`)
+
+Der Harness kann alle 128 SPD-Kommandos durchspielen (`--spd-dump`, optional
+`--spd-range lo hi`, `--spd-out file`) und das Ergebnis als SPD-Image schreiben. Der
+ReadByte-Reply folgt `spd[command]` (aus `--spd "hex"` oder `--spd @file.bin`); ohne
+`--spd` ist es das Sample-Byte `0x12`.
+
+Round-Trip verifiziert: ein 128-Byte-Image `00..7f` wird für **FId (`0x0B00`)** und
+**FIb-Index 1 (`0x0B20`)** identisch zurückgelesen — d. h. Adresse, Command und Datenpfad
+sind über den gesamten Bereich korrekt.
 
 ### Einordnung
 

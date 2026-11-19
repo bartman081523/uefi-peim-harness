@@ -15,12 +15,16 @@ USAGE = """\
 32-bit UEFI PEIM execution harness (Unicorn + Capstone)
 
 Usage:
-  unicorn_peim.py <module.pe.bin> [max_insns] [--exec [op] [slave] [cmd]] [--spd DATA]
+  unicorn_peim.py <module.pe.bin> [max_insns] [--exec [op] [slave] [cmd]]
+                  [--spd DATA] [--spd-dump [--spd-range L H] [--spd-out FILE]]
 
   --exec          after the entry, call the installed SMBus PPI Execute handler
                   (defaults: op=4 EfiSmbusReadByte, slave=0x50, cmd=0x00)
   --spd DATA      SPD byte image for ReadByte replies: hex ("12 34 56") or
                   @file.bin. The reply byte is spd[command]; default 0x12.
+  --spd-dump      walk commands 0x00..0x7F and write the replies as an SPD image
+  --spd-range L H restrict --spd-dump to commands L..H (inclusive)
+  --spd-out FILE  output path for --spd-dump (default spd_dump.bin)
 
 Environment:
   PEIM_PPI_INDEX  choose among multiple 0x58 PPI candidates (default 0)
@@ -115,6 +119,7 @@ instr_count = [0]
 bump = [SCRATCH + 0x1000]
 alloc_log = []
 returned = [False]
+quiet = [False]
 
 
 def hook_stub(uc_, address, size, _):
@@ -169,7 +174,8 @@ def hook_code(uc_, address, size, _):
 def hook_unmapped(uc_, access, address, size, value, _):
     if address == 0xDEADBEEF:
         returned[0] = True
-        print("  ENTRY RETURNED (clean ret to caller)")
+        if not quiet[0]:
+            print("  ENTRY RETURNED (clean ret to caller)")
         uc_.emu_stop()
         return True
     print(f"  UNMAPPED access={access} addr={address:#x} size={size}")
@@ -279,22 +285,33 @@ if "--spd" in sys.argv:
     if _si + 1 < len(sys.argv):
         _spec = sys.argv[_si + 1]
         if _spec.startswith("@"):
-            spd = bytearray(open(_spec, "rb").read())
+            spd = bytearray(open(_spec[1:], "rb").read())
         else:
             spd = bytearray(bytes.fromhex(_spec.replace(",", " ").replace(":", " ")))
 last_cmd = [0]
 
 
+SMBUS_BASES = (0x0B00, 0x0B20)
+
+
+def _smbus_reg(port):
+    for _b in SMBUS_BASES:
+        if _b <= port <= _b + 0x0F:
+            return port - _b
+    return None
+
+
 def hook_in(uc_, port, size, user_data):
     size = size or 1
-    # AMD FCH SMBus host controller at IO base 0x0B00:
-    #   0x0B00 status (bit0 HostBusy), 0x0B01 control, 0x0B02 host command,
-    #   0x0B03 host command byte, 0x0B04 host address, 0x0B05 host data.
-    if port in (0x0B00, 0x0B01, 0x0B02):
+    # AMD FCH SMBus host controller(s) at IO base 0x0B00 (and 0x0B20 for the
+    # second instance): 0 status (bit0 HostBusy), 1 control, 2 host control,
+    # 3 command, 4 address, 5 data.
+    reg = _smbus_reg(port)
+    if reg in (0, 1, 2):
         val = 0x00
-    elif port == 0x0B05:
+    elif reg == 5:
         val = spd[last_cmd[0]] if last_cmd[0] < len(spd) else 0x12
-    elif port == 0x0B04:
+    elif reg == 4:
         val = 0xFF
     else:
         val = (1 << (size * 8)) - 1
@@ -305,7 +322,7 @@ def hook_in(uc_, port, size, user_data):
 def hook_out(uc_, port, size, value, user_data):
     io_state[port] = value
     io_log.append(("W", port, size, value))
-    if port == 0x0B03:
+    if _smbus_reg(port) == 3:
         last_cmd[0] = value & 0xFF
 
 
@@ -345,7 +362,7 @@ if returned[0]:
         except Exception:
             pass
 
-if "--exec" in sys.argv:
+if "--exec" in sys.argv or "--spd-dump" in sys.argv:
     # Exercise the installed SMBus PPI Execute handler after the entry ran.
     returned[0] = False
     exec_sp = STACK + 0x60000
@@ -380,8 +397,9 @@ if "--exec" in sys.argv:
     # cdecl: This, SlaveAddress, Command, Operation, PecCheck, Length*, Buffer*
     # (standard EFI_PEI_SMBUS_PPI_EXECUTE_OPERATION order)
     # Optional CLI args after --exec: operation slave command (defaults: ReadByte 0x50 0x00)
+    _exec_args = sys.argv[sys.argv.index("--exec") + 1:] if "--exec" in sys.argv else []
     _extra = []
-    for _tok in sys.argv[sys.argv.index("--exec") + 1:]:
+    for _tok in _exec_args:
         try:
             int(_tok, 0)
         except ValueError:
@@ -390,6 +408,52 @@ if "--exec" in sys.argv:
     _op = int(_extra[0], 0) if len(_extra) > 0 else 4
     _slave = int(_extra[1], 0) if len(_extra) > 1 else 0x50
     _cmd = int(_extra[2], 0) if len(_extra) > 2 else 0
+
+    if "--spd-dump" in sys.argv:
+        _lo, _hi = 0x00, 0x7F
+        if "--spd-range" in sys.argv:
+            _r = sys.argv.index("--spd-range")
+            _lo = int(sys.argv[_r + 1], 0)
+            _hi = int(sys.argv[_r + 2], 0)
+        _out = "spd_dump.bin"
+        if "--spd-out" in sys.argv:
+            _out = sys.argv[sys.argv.index("--spd-out") + 1]
+        if not spd:
+            print("note: no --spd given; every reply is the default sample byte 0x12")
+        if _execute is None:
+            print("no SMBus PPI interface; skipping dump")
+            sys.exit(1)
+        print(f"=== SPD dump: slave={_slave:#x} op={_op} commands {_lo:#x}..{_hi:#x} ===")
+        quiet[0] = True
+        _img = bytearray()
+        for _c in range(_lo, _hi + 1):
+            _a = [_this or 0, _slave, _c, _op, 0, lenbuf, buffer]
+            uc.mem_write(exec_sp, (0xDEADBEEF).to_bytes(4, "little"))
+            for _i, _v in enumerate(_a):
+                uc.mem_write(exec_sp + 4 + _i * 4, _v.to_bytes(4, "little"))
+            uc.reg_write(UC_X86_REG_ESP, exec_sp)
+            returned[0] = False
+            instr_count[0] = 0
+            if _execute is not None:
+                try:
+                    uc.emu_start(_execute, 0, timeout=0, count=max_insns)
+                except Exception as _e:
+                    # Returning to the 0xDEADBEEF sentinel can surface as
+                    # UC_ERR_MAP even though the hook handled it; that is a
+                    # clean return, not a real fault.
+                    if uc.reg_read(UC_X86_REG_EIP) != 0xDEADBEEF:
+                        print(f"  cmd {_c:#04x}: fault {_e} eip={uc.reg_read(UC_X86_REG_EIP):#x}")
+            _img.append(uc.mem_read(buffer, 1)[0])
+        quiet[0] = False
+        with open(_out, "wb") as _f:
+            _f.write(_img)
+        print(f"wrote {len(_img)} bytes to {_out}")
+        for _o in range(0, len(_img), 16):
+            print(f"{_o:04x}: " + " ".join(f"{b:02x}" for b in _img[_o:_o + 16]))
+        print(f"\nPEI service calls: {len(calls)}")
+        print("allocations:", alloc_log[:20])
+        sys.exit(0)
+
     args = [_this or 0, _slave, _cmd, _op, 0, lenbuf, buffer]
     uc.mem_write(exec_sp, (0xDEADBEEF).to_bytes(4, "little"))
     for i, a in enumerate(args):
