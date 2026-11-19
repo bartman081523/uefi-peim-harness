@@ -98,6 +98,9 @@ Unicorn 2.1.x cannot hook `RDTSC`, `RDMSR`, or arbitrary instructions through
 - Installs **x86 IO-port hooks** (`IN`/`OUT`). The SMBus host controller is IO-decoded at
   **`0x0B00`**; register 0 is the host status word and bit 0 is `HostBusy`. The hook reports
   an idle/error-free controller (`0x00`) so the driver's `in al,dx` poll terminates.
+- Emulates the **PPI notify service** (`table+0x20`): its 5th argument is an out-pointer that
+  must receive a parent function table. Some revisions dispatch their delay/ARP path through
+  that table; without it, the run faults on a NULL vtable.
 
 ## SMBus PPI
 
@@ -148,8 +151,10 @@ With the sample data byte, `Execute` returns `EFI_SUCCESS` and the caller's buff
 - The SMBus **data byte is a fixed sample** (`0x12` on registers `0x0B04/0x0B05`). Address
   and command are derived correctly from the PPI arguments, but real SPD contents require
   feeding the actual DIMM data into the `0x0B05` read.
-- Some firmware revisions take a different private-context/callback branch and fault on a
-  null vtable (see `docs/`). This is a target-specific follow-up, not a harness bug.
+- Different firmware revisions can expose several PPI instances. On the tested image,
+  index `0` is the SMBus PPI (returns `EFI_SUCCESS`), index `1` is a second SMBus instance
+  with no responding device (`EFI_TIMEOUT`), and indexes `2/3` are a different PPI class
+  that rejects the parameters (`EFI_INVALID_PARAMETER`). Use `PEIM_PPI_INDEX` to select one.
 
 ## Docs
 

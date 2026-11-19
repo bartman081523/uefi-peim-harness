@@ -136,6 +136,7 @@ Beim ersten Lauf hing `Execute` in drei verschiedenen Poll-Schleifen; Ursachen +
 | P-State-Erkennung | `rdmsr 0xC0010064+i`, Test EDX-Bit31; `uc.msr_write` wirkt nicht auf `rdmsr` | Capstone-Scan → Code-Hook liefert gültigen P-State-MSR (`bit63|DfsId<<8|Fid`) |
 | Endlos-Delay | RDTSC-Schleife mit großem Ziel | Delay-Funktion (Entry = `min(rdtsc)-1`) per Hook sofort zurückkehren |
 | SMBus-Status | `in al,dx` auf Status-Reg. 0, wartet auf **HostBusy (Bit0)=0**; Unicorn hat kein IO-Backend | `IN`/`OUT`-Hooks: `0x0B00/01/02` ⇒ `0x00` (idle), `0x0B04/05` ⇒ Sample-Byte, sonst `0xFF` |
+| PPI-Vtable (FIb) | Slot 8 (`table+0x20`) muss eine Parent-Vtable an `[ppi+0x20]` liefern; der Stub schrieb nichts → ARP-Wrapper `[This-8]=0` | Slot-8-Hook schreibt Fake-Vtable (`[VTABLE+4]` = `mov eax,0; ret`-Stub) |
 
 ### Beobachtete IO-Sequenz (FId, ISA-IO-Basis `0x0B00`)
 
@@ -167,32 +168,31 @@ Damit ist die Transaktion **vollständig**: Adresse `0xA1`, Command `0x00`, gele
 `findings/smbuspei_fib_vs_fid.md`), die Frequenz kommt aus den P-State-MSRs — beides ist
 oben emuliert.
 
-### FIb-Status (offen)
+### FIb-Status (gelöst)
 
 FIb hat vier 0x58-PPI-Kandidaten (`PEIM_PPI_INDEX=0..3`):
 
 | Index | `This` | `Execute` | Ergebnis |
 |------:|--------|-----------|----------|
-| 0 | `0x90001060` | `0x9ded3ae` | Fault `0x9ded4a5` (Null-Vtable) nach 261 Instr. |
-| 1 | `0x90001260` | `0x9ded3ae` | Fault `0x9ded4a5` nach 19 099 Instr. |
+| 0 | `0x90001060` | `0x9ded3ae` | **`EFI_SUCCESS`**, Buffer `0x12`, 20 963 Instr. |
+| 1 | `0x90001260` | `0x9ded3ae` | `0x80000007` (`EFI_TIMEOUT`), 1.92 M Instr. |
 | 2 | `0x90001460` | `0x9ded4ac` | sauberer Return, `eax=0x80000002` (`EFI_INVALID_PARAMETER`), 76 Instr. |
 | 3 | `0x90001660` | `0x9ded4ac` | identisch zu Index 2 |
 
-**Ursache FIb (0/1):** FIb nutzt im Wartepfad einen **Vtable-Dispatch**
-(`mov eax,[edi]; call [eax+4]` → ArpDevice-Wrapper → `[This-8]`=0), während FId an
-derselben Stelle direkt `0x9dee001` (Delay/Frequenz) ruft. Die Vtable-Back-Pointer
-(`[This-8]`) wird in FIb offenbar über einen PEI-Service initialisiert, den unser Fake
-nicht bedient. **Index 2/3** ist eine zweite PPI-Instanz mit anderem Protokoll und weist
-unsere Parameter mit `EFI_INVALID_PARAMETER` ab.
+**Ursache & Fix:** FIb nutzt im Wartepfad einen **Vtable-Dispatch** (`mov eax,[edi];
+call [eax+4]` → ARP-Wrapper `0x9ded496` → `[This-8]`). Der Entry ruft dafür den
+PEI-Service `table+0x20` (Slot 8) mit `&[ppi+0x20]` als 5. Argument auf; der Service soll
+dort die Parent-Vtable eintragen. Unser Stub schrieb nichts → `[ppi+0x20]=0` → Fault bei
+`0x9ded4a5`. Der Slot-8-Hook schreibt jetzt eine Fake-Vtable (`[VTABLE+4]` = `mov eax,0;
+ret`-Stub). Danach läuft **FIb Index 0** durch.
 
-Nächster Schritt: den FIb-Wartepfad statisch nachvollziehen (wer setzt `[This-8]`, welcher
-PEI-Service) und den Kontext vor `Execute` entsprechend aufbauen — oder den FIb-Index 0/1
-mit einem vorinitialisierten Vtable-Back-Pointer testen.
+Index 1 ist eine zweite SMBus-Instanz ohne antwortendes Gerät (`EFI_TIMEOUT` nach 0x10000
+ARP-Versuchen); Index 2/3 ist eine andere PPI-Klasse, die unsere Parameter ablehnt.
 
 ### Einordnung
 
-- **FId:** SMBus-PPI `Execute` ist end-to-end emuliert (Erfolgspfad, vollständiger IO-Trace,
-  Datenrückgabe in den Caller-Buffer) → **A**.
+- **FId und FIb (Index 0):** SMBus-PPI `Execute` ist end-to-end emuliert (Erfolgspfad,
+  vollständiger IO-Trace, Datenrückgabe in den Caller-Buffer) → **A**.
 - Der **Dateninhalt** ist als Sample-Byte (`0x12`) modelliert; für echte SPD-Daten muss der
   `0x0B05`-Read mit dem DIMM-Inhalt gespeist werden. Adresse (`0xA1`) und Command (`0x00`)
   werden korrekt aus den PPI-Argumenten gebildet.

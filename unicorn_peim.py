@@ -46,6 +46,8 @@ SCRATCH_SIZE = 0x400000
 NSLOT = 128
 STUB_STRIDE = 8
 ALLOC_SLOT = 19  # table+0x4c
+NOTIFY_SLOT = 8  # table+0x20: installs a notify table; out-arg5 receives a vtable
+VTABLE = TABLE + 0x800  # fake parent table used by the PPI ARP wrapper
 
 uc = Uc(UC_ARCH_X86, UC_MODE_32)
 
@@ -77,6 +79,12 @@ for i in range(NSLOT):
     uc.mem_write(TABLE + i * 4, (STUBS + i * STUB_STRIDE).to_bytes(4, "little"))
 uc.mem_write(PPS, TABLE.to_bytes(4, "little"))
 
+# The PPI notify service hands back a "parent" table via an out-parameter; the
+# ARP wrapper later calls [parent+4]. Provide a table whose method returns 0
+# (the slot-0 stub is `mov eax,0; ret`).
+uc.mem_write(VTABLE, (0).to_bytes(4, "little"))
+uc.mem_write(VTABLE + 4, (STUBS).to_bytes(4, "little"))
+
 
 def u32(addr): return int.from_bytes(uc.mem_read(addr, 4), "little")
 def w32(addr, val): uc.mem_write(addr, val.to_bytes(4, "little"))
@@ -92,7 +100,7 @@ returned = [False]
 def hook_stub(uc_, address, size, _):
     idx = (address - STUBS) // STUB_STRIDE
     calls.append(idx)
-    if len(calls) > 2000:
+    if len(calls) > 200000:
         uc_.emu_stop()
         return
     esp = uc_.reg_read(UC_X86_REG_ESP)
@@ -117,6 +125,17 @@ def hook_stub(uc_, address, size, _):
         alloc_log.append((req, ptr))
         if len(alloc_log) <= 20:
             print(f"  slot {idx} ALLOC size={req:#x} -> {ptr:#x} (this={this:#x})")
+    elif idx == NOTIFY_SLOT:
+        # Out-argument 5 is &[ppi+0x20]; hand back the fake parent table so the
+        # PPI's ARP/dispatch wrapper has a valid vtable instead of NULL.
+        outp = u32(esp + 0x14)
+        if outp:
+            try:
+                w32(outp, VTABLE)
+            except Exception:
+                pass
+        if len(calls) <= 40:
+            print(f"  slot {idx} NOTIFY (table+{idx*4:#x}) out={outp:#x} -> {VTABLE:#x}")
     elif len(calls) <= 40:
         print(f"  slot {idx} (table+{idx*4:#x}) esp={esp:#x} args={u32(esp+4):#x},{u32(esp+8):#x},{u32(esp+0xc):#x}")
 
