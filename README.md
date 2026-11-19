@@ -51,6 +51,13 @@ python unicorn_peim.py SmBusPei.pe.bin 200000 --exec            # ReadByte, 0x50
 python unicorn_peim.py SmBusPei.pe.bin 200000 --exec 4 0x51 0x10
 ```
 
+If an image installs several PPI candidates, select one with the `PEIM_PPI_INDEX`
+environment variable (`0` by default):
+
+```bash
+PEIM_PPI_INDEX=2 python unicorn_peim.py SmBusPei.pe.bin 200000 --exec
+```
+
 ### Getting a `module.pe.bin`
 
 Extract the PEIM from a firmware volume (e.g. UEFITool / `uefi-firmware-parser`) and keep the
@@ -106,30 +113,41 @@ pointers:
 
 The harness discovers the interface dynamically (first `0x58` allocation with four valid
 in-image pointers), so it works across images with different load addresses. `--exec` calls
-`Execute(This, Operation, SlaveAddress, Command, PecCheck, Length*, Buffer*)` using the cdecl
-convention.
+`Execute(This, SlaveAddress, Command, Operation, PecCheck, Length*, Buffer*)` using the cdecl
+convention (the standard `EFI_PEI_SMBUS_PPI_EXECUTE_OPERATION` order).
 
-Observed transaction (ReadByte, slave `0x50`):
+Observed transaction (ReadByte, slave `0x50`, command `0x00`, with the standard
+`Execute(This, SlaveAddress, Command, Operation, PecCheck, Length*, Buffer*)` order):
 
 ```
+; controller init / bus-free
 R 0x0B08                         ; bus-free status
 W 0x0B08 = 0xFF
 R 0x00ED ; R 0x00ED              ; AMD delay port
 R 0x0B08                         ; bit 4 (0x10) set -> bus free
-W 0x0B00 = 0x1F                  ; host control/start
-R 0x00ED ; R 0x00ED
-R 0x0B00 = 0x00                  ; HostBusy cleared -> done
-W 0x0B01 = 0x3F                  ; follow-up register poll
+W 0x0B00 = 0x1F                  ; clear status bits
+R 0x0B00 = 0x00                  ; HostBusy cleared
+W 0x0B01 = 0x3F                  ; control/enable
+
+; ReadByte transaction (0x0B03 command, 0x0B04 address, 0x0B05 data)
+W 0x0B04 = 0xA1                  ; SlaveAddress 0x50 << 1 | Read
+W 0x0B03 = 0x00                  ; Command
+W 0x0B02 = 0x48                  ; host control: start + ReadByte protocol
+R 0x0B05 = 0x12                  ; host data 0  -> caller buffer
+W 0x0B02 = 0x00                  ; control reset
 ```
+
+With the sample data byte, `Execute` returns `EFI_SUCCESS` and the caller's buffer contains
+`0x12` (`len=1`).
 
 ## Limitations
 
 - The PEI-services table is **AMI-extended**, not the standard `PiPeiCis` order
   (slot `0x4c` is allocate in these images). Slot names beyond the observed ones are inferred.
 - No real PEI core, no HOBs, no memory map — services are stubs/loggers.
-- The SMBus **data phase is not modelled**: the status/read path returns `0xFF`, so the
-  returned buffer is not real SPD data. The address/command register writes of the ReadByte
-  path were not observed in the traced run.
+- The SMBus **data byte is a fixed sample** (`0x12` on registers `0x0B04/0x0B05`). Address
+  and command are derived correctly from the PPI arguments, but real SPD contents require
+  feeding the actual DIMM data into the `0x0B05` read.
 - Some firmware revisions take a different private-context/callback branch and fault on a
   null vtable (see `docs/`). This is a target-specific follow-up, not a harness bug.
 

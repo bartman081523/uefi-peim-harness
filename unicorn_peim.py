@@ -7,16 +7,7 @@ Service slot 19 (table+0x4c) behaves like an allocate-and-return-pointer
 service: it is given (This, size, *out) and the caller reads the pointer from
 *out afterwards. We emulate that with a bump allocator so the PEIM can proceed.
 
-RDTSC/RDMSR are emulated via Capstone-scanned code hooks (Unicorn 2.1.x cannot
-hook them through UC_HOOK_INSN), the RDTSC delay helper is skipped, and x86 IO
-ports are hooked so SMBus status polls terminate.
-
-Usage:
-  unicorn_peim.py <module.pe.bin> [max_insns]
-  unicorn_peim.py <module.pe.bin> [max_insns] --exec [operation] [slave] [command]
-
-With --exec, the installed SMBus PPI Execute handler is called after the entry
-(defaults: operation=4/EfiSmbusReadByte, slave=0x50, command=0x00).
+Usage: unicorn_peim.py <module.pe.bin> [max_insns]
 """
 import sys
 from pefile import PE
@@ -244,11 +235,15 @@ io_state = {}
 
 def hook_in(uc_, port, size, user_data):
     size = size or 1
-    # The AMD FCH SMBus host controller at IO base 0x0B00: register 0 is the
-    # host status word. Bit0 is HostBusy -- the driver spins until it clears,
-    # so report an idle, error-free controller. Other ports read as 0xFF.
-    if port == 0x0B00:
+    # AMD FCH SMBus host controller at IO base 0x0B00:
+    #   0x0B00 status (bit0 HostBusy), 0x0B01 control, 0x0B02 host command,
+    #   0x0B03 host address, 0x0B04/0x0B05 host data.
+    # Report an idle, error-free controller and a sample SPD data byte, so the
+    # driver's poll and data phase both make progress.
+    if port in (0x0B00, 0x0B01, 0x0B02):
         val = 0x00
+    elif port in (0x0B04, 0x0B05):
+        val = 0x12  # sample byte (real SPD contents depend on the DIMM)
     else:
         val = (1 << (size * 8)) - 1
     io_log.append(("R", port, size, val))
@@ -305,8 +300,7 @@ if "--exec" in sys.argv:
     uc.mem_write(lenbuf, (1).to_bytes(4, "little"))
     # Locate the installed SMBus PPI interface: a 0x58-byte allocation whose
     # first four dwords form a function table of in-image code pointers.
-    _this = None
-    _execute = None
+    _cands = []
     for (_sz, _ptr) in alloc_log:
         if _sz != 0x58:
             continue
@@ -315,21 +309,28 @@ if "--exec" in sys.argv:
         except Exception:
             continue
         if all(ib <= _fp < ib + size_of_image for _fp in _fps):
-            _this = _ptr
-            _execute = _fps[0]
-            break
+            _cands.append((_ptr, _fps))
+    import os
+
+    _idx = int(os.environ.get("PEIM_PPI_INDEX", "0"))
+    _this = None
+    _execute = None
+    if _cands:
+        _this, _fps = _cands[min(_idx, len(_cands) - 1)]
+        _execute = _fps[0]
     if _this is None:
         print("\nno SMBus PPI interface found; skipping Execute")
         _execute = None
     else:
         print(f"\nSMBus PPI This={_this:#x} Execute={_execute:#x}")
-    # cdecl: This, Operation, SlaveAddress, Command, PecCheck, Length*, Buffer*
+    # cdecl: This, SlaveAddress, Command, Operation, PecCheck, Length*, Buffer*
+    # (standard EFI_PEI_SMBUS_PPI_EXECUTE_OPERATION order)
     # Optional CLI args after --exec: operation slave command (defaults: ReadByte 0x50 0x00)
     _extra = sys.argv[sys.argv.index("--exec") + 1:]
     _op = int(_extra[0], 0) if len(_extra) > 0 else 4
     _slave = int(_extra[1], 0) if len(_extra) > 1 else 0x50
     _cmd = int(_extra[2], 0) if len(_extra) > 2 else 0
-    args = [_this or 0, _op, _slave, _cmd, 0, lenbuf, buffer]
+    args = [_this or 0, _slave, _cmd, _op, 0, lenbuf, buffer]
     uc.mem_write(exec_sp, (0xDEADBEEF).to_bytes(4, "little"))
     for i, a in enumerate(args):
         uc.mem_write(exec_sp + 4 + i * 4, a.to_bytes(4, "little"))
@@ -364,10 +365,15 @@ if "--exec" in sys.argv:
     print("hot pcs:", [(hex(a), c) for a, c in _pc_hist.most_common(8)])
     _exec_io = io_log[_io_before:]
     print("exec IO accesses:", len(_exec_io))
-    for _ent in _exec_io[:80]:
+    for _ent in _exec_io[:2000]:
         _rw, _port, _sz, _val = _ent
         print(f"  IO {_rw} port={_port:#06x} size={_sz} val={_val:#x}")
     print("Execute eax:", hex(uc.reg_read(UC_X86_REG_EAX)))
+    try:
+        _len = int.from_bytes(uc.mem_read(lenbuf, 4), "little")
+        print(f"out buffer pointer={buffer:#x} len={_len} bytes={uc.mem_read(buffer, max(1, min(_len, 16))).hex(' ')}")
+    except Exception as _e:
+        print("buffer dump failed:", _e)
 
 print(f"\ninstructions executed: {instr_count[0]}")
 print(f"PEI service calls: {len(calls)}")

@@ -114,14 +114,18 @@ FIb/FId unterschiedliche Image-Basen und Handler-Adressen haben.
 
 ### Aufruf
 
-`Execute(This, Operation=EfiSmbusReadByte(4), SlaveAddress=0x50, Command=0x00,
-PecCheck=0, Length=&1, Buffer)`.
+`Execute(This, SlaveAddress=0x50, Command=0x00, Operation=EfiSmbusReadByte(4),
+PecCheck=0, Length=&1, Buffer)` — **Standard-Reihenfolge** des
+`EFI_PEI_SMBUS_PPI_EXECUTE_OPERATION` (`This, SlaveAddress, Command, Operation, PecCheck,
+Length, Buffer`). Eine frühere Variante mit vertauschten Argumenten schrieb `0x09` statt
+`0xA1` ins Adressregister (siehe unten).
 
 **Ergebnis FId:**
 
 ```
 SMBus PPI This=0x90001060 Execute=0x9ded436
-Execute → eax=0x00000000 (EFI_SUCCESS), sauberer Return, 101897 Instruktionen
+Execute → eax=0x00000000 (EFI_SUCCESS), sauberer Return, 92472 Instruktionen
+out buffer: pointer=0x90200040 len=1 bytes=12
 ```
 
 Beim ersten Lauf hing `Execute` in drei verschiedenen Poll-Schleifen; Ursachen + Fixes:
@@ -131,44 +135,67 @@ Beim ersten Lauf hing `Execute` in drei verschiedenen Poll-Schleifen; Ursachen +
 | rdtsc-Delay | Unicorn 2.1.4 kann `RDTSC` nicht per `UC_HOOK_INSN` hooken | Capstone-Scan → Code-Hook, `EIP+=2`, synthetischer TSC |
 | P-State-Erkennung | `rdmsr 0xC0010064+i`, Test EDX-Bit31; `uc.msr_write` wirkt nicht auf `rdmsr` | Capstone-Scan → Code-Hook liefert gültigen P-State-MSR (`bit63|DfsId<<8|Fid`) |
 | Endlos-Delay | RDTSC-Schleife mit großem Ziel | Delay-Funktion (Entry = `min(rdtsc)-1`) per Hook sofort zurückkehren |
-| SMBus-Status | `in al,dx` auf Status-Reg. 0, wartet auf **HostBusy (Bit0)=0**; Unicorn hat kein IO-Backend | `IN`/`OUT`-Hooks + Status-Reg. `0x0B00` ⇒ `0x00` (idle), sonst `0xFF` |
+| SMBus-Status | `in al,dx` auf Status-Reg. 0, wartet auf **HostBusy (Bit0)=0**; Unicorn hat kein IO-Backend | `IN`/`OUT`-Hooks: `0x0B00/01/02` ⇒ `0x00` (idle), `0x0B04/05` ⇒ Sample-Byte, sonst `0xFF` |
 
 ### Beobachtete IO-Sequenz (FId, ISA-IO-Basis `0x0B00`)
 
 Der SMBus-Controller ist **IO-decoded bei `0x0B00`** (der Entry nutzt daneben das
-MMIO-Fenster `0xFED80300`):
+MMIO-Fenster `0xFED80300`). Register: `0x0B00` Status, `0x0B01` Control, `0x0B02`
+Host-Control, `0x0B03` Host-Command, `0x0B04` Host-Adresse, `0x0B05` Host-Data 0.
 
 ```
-R 0x0B08                               ; Bus-free-Status lesen
+; --- Controller-Init / Bus-free (0x9dedafb) ---
+R 0x0B08                               ; Bus-free-Status
 W 0x0B08 = 0xFF
 R 0x00ED ; R 0x00ED                    ; AMD-Standard-Delay (Port 0xED)
 R 0x0B08                               ; Bit4 (0x10) gesetzt → Bus frei
-W 0x0B00 = 0x1F                        ; Host-Control/Start (0x1E | Start-Bit)
-R 0x00ED ; R 0x00ED
-R 0x0B00 = 0x00                        ; HostBusy=0 → Transaktion „fertig"
-W 0x0B01 = 0x3F                        ; Folge-Register, wird gepollt
-R 0x0B01 ...
+W 0x0B00 = 0x1F                        ; Status-Bits löschen
+R 0x0B00 = 0x00                        ; HostBusy=0
+W 0x0B01 = 0x3F                        ; Control/Enable
+
+; --- ReadByte-Transaktion (Slave 0x50, Command 0x00) ---
+R 0x0B02 = 0x00
+W 0x0B04 = 0xA1                        ; SlaveAddress 0x50 << 1 | Read
+W 0x0B03 = 0x00                        ; Command
+W 0x0B02 = 0x48                        ; Host-Control: Start + ReadByte-Protokoll
+R 0x0B05 = 0x12                        ; Host-Data 0  → Buffer[0]
+W 0x0B02 = 0x00                        ; Control zurücksetzen
 ```
 
-Die Delay-Schleife nutzt `RDTSC` (nur FId: `findings/smbuspei_fib_vs_fid.md`), die
-Frequenz kommt aus den P-State-MSRs — beides ist oben emuliert.
+Damit ist die Transaktion **vollständig**: Adresse `0xA1`, Command `0x00`, gelesenes Byte
+`0x12`, das im Caller-Buffer landet. Die Delay-Schleife nutzt `RDTSC` (nur FId:
+`findings/smbuspei_fib_vs_fid.md`), die Frequenz kommt aus den P-State-MSRs — beides ist
+oben emuliert.
 
 ### FIb-Status (offen)
 
-Für FIb wird `Execute=0x9ded3ae` korrekt gefunden, aber der Lauf faultet in einem
-**Callback-Pfad** (`call DWORD PTR [eax+4]` mit `eax=[ecx-8]=0`, d. h. Null-Vtable) bei
-`0x9ded4a5`, nach ~9.7k Instruktionen. Die IO-Sequenz beginnt identisch
-(`0x0B08`/`0x0B00`), FIb erreicht aber einen anderen Kontext-Zweig. Ursache-Hypothese:
-FIb initialisiert die private Kontext-Vtable (`[This-8]`) an anderer Stelle als FId —
-nächster Schritt: FIb-Kontext vor dem `Execute`-Aufruf genauer aufbauen bzw. das richtige
-der vier 0x58-Allocs wählen.
+FIb hat vier 0x58-PPI-Kandidaten (`PEIM_PPI_INDEX=0..3`):
+
+| Index | `This` | `Execute` | Ergebnis |
+|------:|--------|-----------|----------|
+| 0 | `0x90001060` | `0x9ded3ae` | Fault `0x9ded4a5` (Null-Vtable) nach 261 Instr. |
+| 1 | `0x90001260` | `0x9ded3ae` | Fault `0x9ded4a5` nach 19 099 Instr. |
+| 2 | `0x90001460` | `0x9ded4ac` | sauberer Return, `eax=0x80000002` (`EFI_INVALID_PARAMETER`), 76 Instr. |
+| 3 | `0x90001660` | `0x9ded4ac` | identisch zu Index 2 |
+
+**Ursache FIb (0/1):** FIb nutzt im Wartepfad einen **Vtable-Dispatch**
+(`mov eax,[edi]; call [eax+4]` → ArpDevice-Wrapper → `[This-8]`=0), während FId an
+derselben Stelle direkt `0x9dee001` (Delay/Frequenz) ruft. Die Vtable-Back-Pointer
+(`[This-8]`) wird in FIb offenbar über einen PEI-Service initialisiert, den unser Fake
+nicht bedient. **Index 2/3** ist eine zweite PPI-Instanz mit anderem Protokoll und weist
+unsere Parameter mit `EFI_INVALID_PARAMETER` ab.
+
+Nächster Schritt: den FIb-Wartepfad statisch nachvollziehen (wer setzt `[This-8]`, welcher
+PEI-Service) und den Kontext vor `Execute` entsprechend aufbauen — oder den FIb-Index 0/1
+mit einem vorinitialisierten Vtable-Back-Pointer testen.
 
 ### Einordnung
 
-- **FId:** SMBus-PPI `Execute` ist end-to-end emuliert (Erfolgspfad, IO-Trace) → **A**.
-- Der reale **Dateninhalt** (SPD-Byte) ist noch nicht modelliert: der Status-/Datenpfad
-  liefert `0xFF`; die Adress-/Command-Register-Schreibzugriffe des ReadByte-Pfads wurden in
-  diesem Lauf nicht beobachtet. Für „welche Transaktion *genau*" bleibt das ein Follow-up.
+- **FId:** SMBus-PPI `Execute` ist end-to-end emuliert (Erfolgspfad, vollständiger IO-Trace,
+  Datenrückgabe in den Caller-Buffer) → **A**.
+- Der **Dateninhalt** ist als Sample-Byte (`0x12`) modelliert; für echte SPD-Daten muss der
+  `0x0B05`-Read mit dem DIMM-Inhalt gespeist werden. Adresse (`0xA1`) und Command (`0x00`)
+  werden korrekt aus den PPI-Argumenten gebildet.
 - Reproduktion:
   `/home/julian/micromamba/envs/qiling312/bin/python scratches/unicorn_peim.py scratches/p4_SmBusPei_FId_o139.pe.bin 200000 --exec`
 
