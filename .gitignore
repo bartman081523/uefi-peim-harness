@@ -1,0 +1,14 @@
+# Firmware blobs are never committed
+*.bin
+*.rom
+*.fd
+*.cap
+*.bio
+*.pe.bin
+*.te.bin
+*.depex.bin
+*.log
+
+__pycache__/
+*.pyc
+.venv/
