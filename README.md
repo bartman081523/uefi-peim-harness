@@ -26,8 +26,8 @@ reproduces the entry path of `SmBusPei` bit-for-bit-comparable across firmware r
 
 ## Requirements
 
-```
-python3 -m pip install unicorn capstone pefile
+```bash
+python3 -m pip install -r requirements.txt
 ```
 
 Tested with Python 3.12, Unicorn 2.1.4, Capstone 5.0.9.
@@ -41,6 +41,10 @@ python unicorn_peim.py <module.pe.bin> [max_insns]
 # After the entry, call the installed SMBus PPI Execute handler
 # default operation = 4 (EfiSmbusReadByte), slave = 0x50, command = 0x00
 python unicorn_peim.py <module.pe.bin> [max_insns] --exec [operation] [slave] [command]
+
+# Supply SPD data; the ReadByte reply is spd[command]
+python unicorn_peim.py <module.pe.bin> 200000 --exec 4 0x50 0x02 --spd "12 34 56 78"
+python unicorn_peim.py <module.pe.bin> 200000 --exec 4 0x50 0x00 --spd @spd.bin
 ```
 
 Examples:

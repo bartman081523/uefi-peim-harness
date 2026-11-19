@@ -10,6 +10,26 @@ service: it is given (This, size, *out) and the caller reads the pointer from
 Usage: unicorn_peim.py <module.pe.bin> [max_insns]
 """
 import sys
+
+USAGE = """\
+32-bit UEFI PEIM execution harness (Unicorn + Capstone)
+
+Usage:
+  unicorn_peim.py <module.pe.bin> [max_insns] [--exec [op] [slave] [cmd]] [--spd DATA]
+
+  --exec          after the entry, call the installed SMBus PPI Execute handler
+                  (defaults: op=4 EfiSmbusReadByte, slave=0x50, cmd=0x00)
+  --spd DATA      SPD byte image for ReadByte replies: hex ("12 34 56") or
+                  @file.bin. The reply byte is spd[command]; default 0x12.
+
+Environment:
+  PEIM_PPI_INDEX  choose among multiple 0x58 PPI candidates (default 0)
+"""
+
+if "-h" in sys.argv or "--help" in sys.argv or len(sys.argv) < 2:
+    print(USAGE)
+    sys.exit(0)
+
 from pefile import PE
 from unicorn import Uc, UC_ARCH_X86, UC_MODE_32
 from unicorn import UC_HOOK_CODE, UC_HOOK_MEM_UNMAPPED, UC_HOOK_INSN
@@ -251,18 +271,31 @@ from unicorn.x86_const import UC_X86_INS_IN, UC_X86_INS_OUT
 io_log = []
 io_state = {}
 
+# Optional SPD byte image: --spd "12 34 56" or --spd @spd.bin
+# The byte for a ReadByte is taken from spd[command].
+spd = bytearray()
+if "--spd" in sys.argv:
+    _si = sys.argv.index("--spd")
+    if _si + 1 < len(sys.argv):
+        _spec = sys.argv[_si + 1]
+        if _spec.startswith("@"):
+            spd = bytearray(open(_spec, "rb").read())
+        else:
+            spd = bytearray(bytes.fromhex(_spec.replace(",", " ").replace(":", " ")))
+last_cmd = [0]
+
 
 def hook_in(uc_, port, size, user_data):
     size = size or 1
     # AMD FCH SMBus host controller at IO base 0x0B00:
     #   0x0B00 status (bit0 HostBusy), 0x0B01 control, 0x0B02 host command,
-    #   0x0B03 host address, 0x0B04/0x0B05 host data.
-    # Report an idle, error-free controller and a sample SPD data byte, so the
-    # driver's poll and data phase both make progress.
+    #   0x0B03 host command byte, 0x0B04 host address, 0x0B05 host data.
     if port in (0x0B00, 0x0B01, 0x0B02):
         val = 0x00
-    elif port in (0x0B04, 0x0B05):
-        val = 0x12  # sample byte (real SPD contents depend on the DIMM)
+    elif port == 0x0B05:
+        val = spd[last_cmd[0]] if last_cmd[0] < len(spd) else 0x12
+    elif port == 0x0B04:
+        val = 0xFF
     else:
         val = (1 << (size * 8)) - 1
     io_log.append(("R", port, size, val))
@@ -272,6 +305,8 @@ def hook_in(uc_, port, size, user_data):
 def hook_out(uc_, port, size, value, user_data):
     io_state[port] = value
     io_log.append(("W", port, size, value))
+    if port == 0x0B03:
+        last_cmd[0] = value & 0xFF
 
 
 uc.hook_add(UC_HOOK_INSN, hook_in, None, 1, 0, UC_X86_INS_IN)
@@ -345,7 +380,13 @@ if "--exec" in sys.argv:
     # cdecl: This, SlaveAddress, Command, Operation, PecCheck, Length*, Buffer*
     # (standard EFI_PEI_SMBUS_PPI_EXECUTE_OPERATION order)
     # Optional CLI args after --exec: operation slave command (defaults: ReadByte 0x50 0x00)
-    _extra = sys.argv[sys.argv.index("--exec") + 1:]
+    _extra = []
+    for _tok in sys.argv[sys.argv.index("--exec") + 1:]:
+        try:
+            int(_tok, 0)
+        except ValueError:
+            break
+        _extra.append(_tok)
     _op = int(_extra[0], 0) if len(_extra) > 0 else 4
     _slave = int(_extra[1], 0) if len(_extra) > 1 else 0x50
     _cmd = int(_extra[2], 0) if len(_extra) > 2 else 0
